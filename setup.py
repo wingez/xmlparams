@@ -4,7 +4,7 @@ setup(
     name='CICU parameters',
     author='Tekniksprånget VT-19',
     version='0.1',
-    py_modules=['yourscript'],
+    py_modules=['program'],
     install_requires=[
         'Click',
     ],

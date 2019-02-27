@@ -13,8 +13,8 @@ class ParseError(Exception):
 @click.command()
 @click.argument('xmlfile', type=click.File())
 @click.argument('paramfile', type=click.File(), required=False)
-@click.option('--params', '-p', multiple=True)
-@click.option('--nonzero', '-z', is_flag=True)
+@click.option('--params', '-p', multiple=True, help='parametercode of parameter to display')
+@click.option('--nonzero', '-z', is_flag=True, help='Display all parameter values, including 0')
 def cli(xmlfile, paramfile, params, nonzero):
     paramnames = list(params)
     if paramfile:
