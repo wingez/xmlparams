@@ -1,21 +1,18 @@
 import click
 import itertools as it
-import copy
 import xml.dom.minidom as xml
 from xml.dom.minidom import Node
-
-from typing import List, Tuple
-
-from functools import wraps
+from typing import List, Tuple, Dict
+from collections import OrderedDict
 
 
 @click.command()
 @click.argument('xmlfile', type=click.File())
 @click.argument('paramfile', type=click.File(), required=False)
 @click.option('--params', '-p', multiple=True)
-def cli(xmlfile, paramfile, params):
+@click.option('--nonzero', '-z', is_flag=True)
+def cli(xmlfile, paramfile, params, nonzero):
     paramnames = list(params)
-
     if paramfile:
         paramnames.extend([line.strip() for line in paramfile])
 
@@ -24,20 +21,22 @@ def cli(xmlfile, paramfile, params):
     dom = xml.parse(xmlfile)
     remove_blanks(dom)
 
-    for param in dom.getElementsByTagName('Parameter'):
+    for xmlparam in dom.getElementsByTagName('Parameter'):
+        parametername = xmlparam.attributes['parameterCode'].value
 
-        paramname = param.attributes['parameterCode'].value
-
-        # if paramnames and paramname not in ['P1AFT']:# paramnames:
-        #    continue
-
-        # TODO
-        if param.attributes['parameterCode'].value != 'P1OLL':
+        if paramnames and parametername.lower() not in paramnames:
             continue
 
-        valueElement = param.firstChild.firstChild
+        parameter = parseNode(xmlparam.firstChild.firstChild)
 
-        print(parseNode(valueElement))
+        if parameter.hasData() or nonzero:
+            if isinstance(parameter, ContainerParameter):
+                for indices, value in parameter.getindicesandvalues():
+
+                    if value.hasData() or nonzero:
+                        print(f'{parametername}: [{",".join(map(str, indices))}] = {value.data}')
+            else:
+                print(f'{parametername}: {parameter.data}')
 
 
 def remove_blanks(node):
@@ -52,12 +51,14 @@ def remove_blanks(node):
 
 
 def parseNode(node):
-    mapping = {'Scalar': PrimitiveParameter,
-               'Boolean': PrimitiveParameter,
+    mapping = {'Scalar': ScalarParameter,
+               'Boolean': BooleanParameter,
                'String': PrimitiveParameter,
                'Array': MatrixParameter,
                'Struct': StructParameter,
                'Identifier': PrimitiveParameter,
+               'Enum': EnumParameter,
+               'Value': PrimitiveParameter,
                }
 
     obj = mapping.get(node.tagName, None)
@@ -67,21 +68,53 @@ def parseNode(node):
     return obj(node)
 
 
-class PrimitiveParameter:
+class Parameter:
+
+    def hasData(self):
+        return True
+
+
+class PrimitiveParameter(Parameter):
     def __init__(self, node):
-        self.data = str(node.firstChild.data)
+        self.data = str(node.firstChild.data) if node.firstChild else ''
+
+    def hasData(self):
+        return bool(self.data)
 
     def __str__(self):
         return self.data
 
 
-class MatrixParameter:
+class ScalarParameter(PrimitiveParameter):
+    def hasData(self):
+        return float(self.data)
+
+
+class BooleanParameter(PrimitiveParameter):
+    def hasData(self):
+        return self.data.lower() == 'true'
+
+
+class EnumParameter(PrimitiveParameter):
     def __init__(self, node):
-        self.values: List[List[str]] = []
-        self.columns, self.rows = 0, 0
+        self.value = parseNode(node.childNodes[0])
+        super(EnumParameter, self).__init__(node.childNodes[1].childNodes[0])
+
+    def hasData(self):
+        return self.value.hasData()
+
+
+class ContainerParameter(Parameter):
+    def getindicesandvalues(self) -> Tuple[List[int], PrimitiveParameter]:
+        raise NotImplementedError
+
+
+class MatrixParameter(ContainerParameter):
+    def __init__(self, node):
+        self.values: List[Parameter] = []
 
         self.parse(node)
-        self.calculatesize()
+        self.ismatrix = False
 
     @staticmethod
     def validateElement(element):
@@ -92,56 +125,37 @@ class MatrixParameter:
 
     def parse(self, node):
 
-        current = []
-
         for element in node.childNodes:
             self.validateElement(element)
             value = element.childNodes[0]
-            if value.tagName != 'Array':
-                current.append(parseNode(value))
-            else:
-                if current:
+            child = parseNode(value)
+
+            if isinstance(child, ContainerParameter):
+                if self.values and not self.ismatrix:
                     raise ValueError()  # TODO
-                self.values.append(self.parseRow(value))
+                self.ismatrix = True
 
-        if current:
-            if self.values:
-                raise ValueError()  # TODO
-            self.values = [current]
+            self.values.append(parseNode(value))
 
-    def parseRow(self, node):
-        result = []
-        for element in node.childNodes:
-            self.validateElement(element)
-            value = parseNode(element.childNodes[0])
-            if type(value) is not PrimitiveParameter:
-                raise ValueError  # TODO
-            result.append(value)
-        return result
+    def hasData(self):
+        return any(param.hasData() for param in self.values)
 
-    def calculatesize(self):
-        cols = len(self.values[0])
-        for row in self.values:
-            if len(row) != cols:
-                raise ValueError('Matrix is not rectangular')
+    def getindicesandvalues(self):
 
-        self.columns = cols
-        self.rows = len(self.values)
+        for index, value in enumerate(self.values):
 
-    def __str__(self):
+            if isinstance(value, ContainerParameter):
 
-        output = [[f'({column + 1})' for column in range(len(self.values[0]))]]
-        output.extend(list(map(str, row)) for row in self.values)
-        for index, row in enumerate(output, ):
-            row.insert(0, f'({index})' if index != 0 else '')
-
-        return format2darray(output)
+                for indices, v in value.getindicesandvalues():
+                    yield [index] + indices, v
+            else:
+                yield [index], value
 
 
-class StructParameter:
+class StructParameter(ContainerParameter):
 
     def __init__(self, node):
-        self.values: List[Tuple[str, PrimitiveParameter]] = []
+        self.values: Dict[str, Parameter] = OrderedDict()
 
         self.parse(node)
 
@@ -156,28 +170,37 @@ class StructParameter:
 
         for element in node.childNodes:
             self.validateElement(element)
-            value = str(parseNode(element.childNodes[0]))
+            value = parseNode(element.childNodes[0])
 
             name = str(parseNode(element.childNodes[1].childNodes[0]))
 
-            self.values.append((name, value))
+            self.values[name] = value
 
-    def __str__(self):
-        array = list(zip(*self.values))
-        return format2darray(array)
+    def hasData(self):
+        return any(param.hasData() for param in self.values.values())
+
+    def getindicesandvalues(self):
+
+        for key, value in self.values.items():
+
+            if isinstance(value, ContainerParameter):
+                for indices, v in value.getindicesandvalues():
+                    yield [key] + indices, v
+            else:
+                yield [key], value
 
 
-def format2darray(array):
-    output = [list(row) for row in array]
-
-    columnswidth = [2 + max(map(len, column)) for column in zip(*output)]
-    for row in output:
-        for (columnindex, value), width in zip(enumerate(row), columnswidth):
-            row[columnindex] = value.ljust(width, ' ')
-
-    rows = [''.join(row) for row in output]
-
-    return '\n'.join(rows)
+# def format2darray(array):
+#     output = [list(row) for row in array]
+#
+#     columnswidth = [2 + max(map(len, column)) for column in zip(*output)]
+#     for row in output:
+#         for (columnindex, value), width in zip(enumerate(row), columnswidth):
+#             row[columnindex] = value.ljust(width, ' ')
+#
+#     rows = [''.join(row) for row in output]
+#
+#     return '\n'.join(rows)
 
 
 if __name__ == '__main__':
