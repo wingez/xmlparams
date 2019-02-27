@@ -1,9 +1,13 @@
 import click
 import itertools as it
+
 import xml.dom.minidom as xml
-from xml.dom.minidom import Node
 from typing import List, Tuple, Dict
 from collections import OrderedDict
+
+
+class ParseError(Exception):
+    pass
 
 
 @click.command()
@@ -41,10 +45,10 @@ def cli(xmlfile, paramfile, params, nonzero):
 
 def remove_blanks(node):
     for x in node.childNodes:
-        if x.nodeType == Node.TEXT_NODE:
+        if x.nodeType == xml.Node.TEXT_NODE:
             if x.nodeValue:
                 x.nodeValue = x.nodeValue.strip()
-        elif x.nodeType == Node.ELEMENT_NODE:
+        elif x.nodeType == xml.Node.ELEMENT_NODE:
             remove_blanks(x)
 
     node.normalize()
@@ -70,7 +74,7 @@ def parseNode(node):
 
 class Parameter:
 
-    def hasData(self):
+    def hasData(self) -> bool:
         return True
 
 
@@ -79,7 +83,7 @@ class PrimitiveParameter(Parameter):
         self.data = str(node.firstChild.data) if node.firstChild else ''
 
     def hasData(self):
-        return bool(self.data)
+        return self.data
 
     def __str__(self):
         return self.data
