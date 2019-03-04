@@ -2,7 +2,7 @@ import click
 import itertools as it
 
 import xml.dom.minidom as xml
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Generator, Iterator, Any
 from collections import OrderedDict
 
 
@@ -11,50 +11,106 @@ class ParseError(Exception):
 
 
 @click.command()
-@click.argument('xmlfile', type=click.File())
-@click.argument('paramfile', type=click.File(), required=False)
-@click.option('--params', '-p', multiple=True, help='parametercode of parameter to display')
+@click.argument('xmlfile', type=click.File(mode='r'))
+@click.argument('paramfile', type=click.File(mode='r'), required=False)
+@click.option('--param', '-p', multiple=True, help='ParameterCode of parameter to display')
 @click.option('--nonzero', '-z', is_flag=True, help='Display all parameter values, including 0')
-def cli(xmlfile, paramfile, params, nonzero):
-    paramnames = list(params)
-    if paramfile:
-        paramnames.extend([line.strip() for line in paramfile])
-
-    paramnames = set(map(str.lower, paramnames))
-
-    dom = xml.parse(xmlfile)
-    remove_blanks(dom)
-
-    for xmlparam in dom.getElementsByTagName('Parameter'):
-        parametername = xmlparam.attributes['parameterCode'].value
-
-        if paramnames and parametername.lower() not in paramnames:
-            continue
-
-        parameter = parseNode(xmlparam.firstChild.firstChild)
-
-        if parameter.hasData() or nonzero:
-            if isinstance(parameter, ContainerParameter):
-                for indices, value in parameter.getindicesandvalues():
-
-                    if value.hasData() or nonzero:
-                        print(f'{parametername}: [{",".join(map(str, indices))}] = {value.data}')
-            else:
-                print(f'{parametername}: {parameter.data}')
+def cli(xmlfile, paramfile, **kwargs):  # param, nonzero, all_):
+    """
+        Parameter analyzer for CICU
 
 
-def remove_blanks(node):
-    for x in node.childNodes:
-        if x.nodeType == xml.Node.TEXT_NODE:
-            if x.nodeValue:
-                x.nodeValue = x.nodeValue.strip()
-        elif x.nodeType == xml.Node.ELEMENT_NODE:
-            remove_blanks(x)
+    """
 
-    node.normalize()
+    filterparams = paramfile or kwargs['param']
+
+    # Get all parameterCodes of interest
+    paramnames = loadparams(paramfile)
+    paramnames.extend(kwargs['param'])
+
+    try:
+        dom = loadxml(xmlfile)
+    except ParseError as ex:
+        print(f'Could not parse xml file. {ex}')
+        return
+
+    xmlparamnodes = {}
+    for param in dom.getElementsByTagName('Parameter'):
+        name = param.attributes['parameterCode'].value
+        xmlparamnodes[name] = param
+
+    if filterparams:
+        # Assert all supplied parameterCodes exists
+        for name in paramnames:
+            if name not in xmlparamnodes:
+                print(f'Parameter {name} not found')
+                return
+
+    parameters = {}
+    for code, xmlnode in xmlparamnodes.items():
+        try:
+            param = parseparameter(xmlnode)
+
+        except ParseError as ex:
+            print(f'Error parsing parameter {code}: {ex}')
+            return
+
+        parameters[code] = param
+
+    if filterparams:
+        for code in paramnames:
+            param = parameters[code]
+            showparameter(param, code, **kwargs)
+    else:
+        for code, param in parameters:
+            showparameter(param, code, **kwargs)
 
 
-def parseNode(node):
+def parseparameter(xmlnode):
+    return parseNode(xmlnode.firstChild.firstChild)
+
+
+def showparameter(parameter, name, **kwargs):
+    if parameter.hasData() or kwargs['nonzero']:
+        if isinstance(parameter, ContainerParameter):
+            for indices, value in parameter.getindicesandvalues():
+
+                if value.hasData() or kwargs['nonzero']:
+                    print(f'{name}: [{",".join(map(str, indices))}] = {value.data}')
+        else:
+            print(f'{name}: {parameter}')
+
+
+def loadparams(paramfile) -> List[str]:
+    result = []
+    for line in paramfile:
+        line = line.strip()
+        if line:
+            result.append(line)
+    return result
+
+
+def loadxml(file):
+    try:
+        dom = xml.parse(file)
+
+    except Exception as ex:
+        raise ParseError(str(ex))
+
+    def remove_empty_nodes(node):
+        for child in node.childNodes:
+            if child.nodeType == xml.Node.TEXT_NODE:
+                if child.nodeValue:
+                    child.nodeValue = child.nodeValue.strip()
+            elif child.nodeType == xml.Node.ELEMENT_NODE:
+                remove_empty_nodes(child)
+
+    remove_empty_nodes(dom)
+    dom.normalize()
+    return dom
+
+
+def parseNode(node) -> 'Parameter':
     mapping = {'Scalar': ScalarParameter,
                'Boolean': BooleanParameter,
                'String': PrimitiveParameter,
@@ -65,11 +121,11 @@ def parseNode(node):
                'Value': PrimitiveParameter,
                }
 
-    obj = mapping.get(node.tagName, None)
-    if not obj:
-        raise ValueError
+    nodename = node.tagName
+    if not nodename or nodename not in mapping:
+        raise ParseError(f'Cannot parse a node with name: {nodename}')
 
-    return obj(node)
+    return mapping[nodename](node)
 
 
 class Parameter:
@@ -109,7 +165,7 @@ class EnumParameter(PrimitiveParameter):
 
 
 class ContainerParameter(Parameter):
-    def getindicesandvalues(self) -> Tuple[List[int], PrimitiveParameter]:
+    def getindicesandvalues(self) -> Generator[Tuple[Iterator[Any], PrimitiveParameter], None, None]:
         raise NotImplementedError
 
 
@@ -123,9 +179,9 @@ class MatrixParameter(ContainerParameter):
     @staticmethod
     def validateElement(element):
         if element.tagName != 'Element':
-            raise ValueError('Expected Element')
+            raise ParseError('Childnodes of array expected to be of type Element')
         if len(element.childNodes) != 1:
-            raise ValueError('Expected Element to have 1 child')
+            raise ParseError('Expected Element to have 1 child only')
 
     def parse(self, node):
 
@@ -136,7 +192,8 @@ class MatrixParameter(ContainerParameter):
 
             if isinstance(child, ContainerParameter):
                 if self.values and not self.ismatrix:
-                    raise ValueError()  # TODO
+                    raise ParseError(f'Trying to create a non-rectangular array')
+
                 self.ismatrix = True
 
             self.values.append(parseNode(value))
@@ -166,9 +223,9 @@ class StructParameter(ContainerParameter):
     @staticmethod
     def validateElement(element):
         if element.tagName != 'Element':
-            raise ValueError('Expected Element')
+            raise ParseError('Childnodes of struct expected to be of type Element')
         if len(element.childNodes) != 2:
-            raise ValueError('Expected Element to have 2 child')
+            raise ParseError('Expected Element to have 2 children')
 
     def parse(self, node):
 
@@ -194,17 +251,17 @@ class StructParameter(ContainerParameter):
                 yield [key], value
 
 
-# def format2darray(array):
-#     output = [list(row) for row in array]
-#
-#     columnswidth = [2 + max(map(len, column)) for column in zip(*output)]
-#     for row in output:
-#         for (columnindex, value), width in zip(enumerate(row), columnswidth):
-#             row[columnindex] = value.ljust(width, ' ')
-#
-#     rows = [''.join(row) for row in output]
-#
-#     return '\n'.join(rows)
+def format2darray(array: Iterator[Iterator[Any]]):
+    output = [list(row) for row in array]
+
+    columnwidths = [2 + max(map(len, column)) for column in zip(*output)]
+    for row in output:
+        for (columnindex, value), width in zip(enumerate(row), columnwidths):
+            row[columnindex] = value.ljust(width, ' ')
+
+    rows = [''.join(row) for row in output]
+
+    return '\n'.join(rows)
 
 
 if __name__ == '__main__':
